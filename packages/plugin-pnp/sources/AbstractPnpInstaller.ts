@@ -199,6 +199,9 @@ export abstract class AbstractPnpInstaller implements Installer {
     const key1 = structUtils.requirableIdent(pkg);
     const key2 = pkg.reference;
 
+    const isWorkspace =
+      !!this.opts.project.tryWorkspaceByLocator(pkg);
+
     const hasVirtualInstances =
       // Only packages with peer dependencies have virtual instances
       pkg.peerDependencies.size > 0 &&
@@ -209,7 +212,7 @@ export abstract class AbstractPnpInstaller implements Installer {
       // Virtual instance templates don't need to be built, since they don't truly exist
       !hasVirtualInstances &&
       // Workspaces aren't built by the linkers; they are managed by the core itself
-      !this.opts.project.tryWorkspaceByLocator(pkg) &&
+      !isWorkspace &&
       // Only build the packages if the final installer tells us to
       this.getChildClassSettings().installPackageBuilds;
 
@@ -261,7 +264,9 @@ export abstract class AbstractPnpInstaller implements Installer {
       discardFromLookup: fetchResult.discardFromLookup || false,
     });
 
-    if (hasVirtualInstances)
+    // Workspaces can always be accessed from their own directories, even if
+    // they have virtual instances, since they have their own perspective.
+    if (hasVirtualInstances && !isWorkspace)
       this.blacklistedPaths.add(packageLocation);
 
     // Ignore the build scripts if the package isn't compatible with the current system
