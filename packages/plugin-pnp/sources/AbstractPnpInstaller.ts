@@ -1,49 +1,111 @@
-import {Installer, LinkOptions, LinkType, MessageName, DependencyMeta, FinalizeInstallStatus, Manifest, LocatorHash} from '@yarnpkg/core';
-import {FetchResult, Descriptor, Locator, Package, BuildDirective}                                                   from '@yarnpkg/core';
-import {PackageMeta}                                                                                                 from '@yarnpkg/core';
-import {miscUtils, structUtils}                                                                                      from '@yarnpkg/core';
-import {FakeFS, PortablePath, ppath}                                                                                 from '@yarnpkg/fslib';
-import {PackageRegistry, PnpSettings}                                                                                from '@yarnpkg/pnp';
+import {Installer, LinkOptions, LinkType, MessageName, DependencyMeta, Manifest, LocatorHash, FinalizeInstallData, BuildType} from '@yarnpkg/core';
+import {FetchResult, Descriptor, Locator, Package, BuildDirective}                                                            from '@yarnpkg/core';
+import {miscUtils, structUtils}                                                                                               from '@yarnpkg/core';
+import {FakeFS, Filename, PortablePath, ppath}                                                                                from '@yarnpkg/fslib';
+import {PackageRegistry, PnpSettings}                                                                                         from '@yarnpkg/pnp';
+
+const cachedFields = new Set([
+  `bin` as const,
+  `cpu` as const,
+  `os` as const,
+  `preferUnplugged` as const,
+  `scripts` as const,
+]);
+
+const cachedScripts = new Set([
+  `preinstall`,
+  `install`,
+  `postinstall`,
+]);
+
+const FORCED_UNPLUG_FILETYPES = new Set([
+  // Windows can't execute exe files inside zip archives
+  `.exe`,
+  // The c/c++ compiler can't read files from zip archives
+  `.h`, `.hh`, `.hpp`, `.c`, `.cc`, `.cpp`,
+  // The java runtime can't read files from zip archives
+  `.java`, `.jar`,
+  // Node opens these through dlopen
+  `.node`,
+]);
+
+type SetValue<T> = T extends Set<infer U> ? U : never;
+
+export type PartialManifest = Pick<Manifest, SetValue<typeof cachedFields>>;
+export type PackageDataRecord = {
+  extractHint: boolean,
+  hasBindingGyp: boolean,
+  manifest: PartialManifest,
+};
 
 export type AbstractInstallerOptions = LinkOptions & {
   skipIncompatiblePackageLinking?: boolean;
 };
 
-export abstract class AbstractPnpInstaller implements Installer {
-  private readonly packageRegistry: PackageRegistry = new Map();
-  private readonly packageMetas = new Map<LocatorHash, PackageMeta>();
+export type AbstractInstallerCustomData = {
+  store: Map<LocatorHash, PackageDataRecord>,
+};
 
-  private readonly blacklistedPaths: Set<PortablePath> = new Set();
+export abstract class AbstractPnpInstaller implements Installer {
+  private packageRegistry: PackageRegistry = new Map();
+  private blacklistedPaths: Set<PortablePath> = new Set();
+
+  private extraneousPackageRecords: Set<LocatorHash> = new Set();
+  private customData: AbstractInstallerCustomData = {store: new Map()};
 
   constructor(protected opts: AbstractInstallerOptions) {
     this.opts = opts;
   }
 
   /**
-   * Called in order to know whether the specified package has build scripts.
+   * Allow child classes to tweaks a few settings.
    */
-  abstract getBuildScripts(locator: Locator, manifest: Manifest | null, fetchResult: FetchResult): Promise<Array<BuildDirective>>;
+  abstract getChildClassSettings(): {
+    installPackageBuilds: boolean;
+  };
 
   /**
    * Called to transform the package before it's stored in the PnP map. For
    * example we use this in the PnP linker to materialize the packages within
    * their own directories when they have build scripts.
    */
-  abstract transformPackage(locator: Locator, packageMeta: PackageMeta, fetchResult: FetchResult, dependencyMeta: DependencyMeta, flags: {hasBuildScripts: boolean}): Promise<FakeFS<PortablePath>>;
+  abstract transformPackage(pkg: Package, pkgDataRecord: PackageDataRecord, fetchResult: FetchResult, dependencyMeta: DependencyMeta): Promise<FakeFS<PortablePath>>;
 
   /**
    * Called with the full settings, ready to be used by the @yarnpkg/pnp
    * package.
    */
-  abstract finalizeInstallWithPnp(pnpSettings: PnpSettings,  packageMetas: Map<LocatorHash, PackageMeta>): Promise<Array<FinalizeInstallStatus> | void>;
+  abstract finalizeInstallWithPnp(pnpSettings: PnpSettings): Promise<FinalizeInstallData | void>;
 
-  protected checkAndReportManifestIncompatibility(manifest: Manifest | null, pkg: Package): boolean {
-    if (manifest && !manifest.isCompatibleWithOS(process.platform)) {
+  getCustomDataKey() {
+    return JSON.stringify({
+      name: `AbstractPnpInstaller`,
+      version: 1,
+    });
+  }
+
+  attachCustomData(customData: {AbstractPnpInstaller: AbstractInstallerCustomData}) {
+    this.extraneousPackageRecords = new Set(customData.AbstractPnpInstaller.store.keys());
+    this.customData = customData.AbstractPnpInstaller;
+  }
+
+  private checkManifestCompatibility(pkg: Package, manifest: Pick<Manifest, 'os' | 'cpu'>) {
+    if (!Manifest.isManifestFieldCompatible(manifest.os, process.platform))
+      return false;
+
+    if (!Manifest.isManifestFieldCompatible(manifest.cpu, process.arch))
+      return false;
+
+    return true;
+  }
+
+  private checkAndReportManifestCompatibility(pkg: Package, manifest: Pick<Manifest, 'os' | 'cpu'>) {
+    if (!Manifest.isManifestFieldCompatible(manifest.os, process.platform)) {
       this.opts.report.reportWarningOnce(MessageName.INCOMPATIBLE_OS, `${structUtils.prettyLocator(this.opts.project.configuration, pkg)} The platform ${process.platform} is incompatible with this module, ${this.opts.skipIncompatiblePackageLinking ? `linking` : `building`} skipped.`);
       return false;
     }
 
-    if (manifest && !manifest.isCompatibleWithCPU(process.arch)) {
+    if (!Manifest.isManifestFieldCompatible(manifest.cpu, process.arch)) {
       this.opts.report.reportWarningOnce(MessageName.INCOMPATIBLE_CPU, `${structUtils.prettyLocator(this.opts.project.configuration, pkg)} The CPU architecture ${process.arch} is incompatible with this module, ${this.opts.skipIncompatiblePackageLinking ? `linking` : `building`} skipped.`);
       return false;
     }
@@ -51,25 +113,67 @@ export abstract class AbstractPnpInstaller implements Installer {
     return true;
   }
 
-  abstract getPackageMetaKey(pkg: Package): string;
-  abstract fetchPackageMeta(pkg: Package, fetchResult: FetchResult): Promise<PackageMeta>;
+  private async fetchPackageDataRecord(fetchResult: FetchResult) {
+    const bindingFilePath = ppath.join(fetchResult.prefixPath, `binding.gyp` as Filename);
+    const hasBindingGyp = fetchResult.packageFs.existsSync(bindingFilePath);
 
-  async installPackage(pkg: Package, fetchResult: FetchResult, packageMeta: PackageMeta) {
-    this.packageMetas.set(pkg.locatorHash, packageMeta);
+    const extractHint = fetchResult.packageFs.getExtractHint({relevantExtensions:FORCED_UNPLUG_FILETYPES});
 
-    const key1 = structUtils.requirableIdent(pkg);
-    const key2 = pkg.reference;
+    const data: PackageDataRecord = {
+      extractHint,
+      hasBindingGyp,
+      manifest: {} as any,
+    };
 
-    if (this.opts.skipIncompatiblePackageLinking && !packageMeta.isManifestCompatible)
-      return {packageLocation: null, buildDirective: null};
+    const manifest = await Manifest.tryFind(fetchResult.prefixPath, {baseFs: fetchResult.packageFs});
+    const effectiveManifest = manifest ?? new Manifest();
 
-    const hasVirtualInstances =
-      pkg.peerDependencies.size > 0 &&
-      !structUtils.isVirtualLocator(pkg) &&
-      !this.opts.project.tryWorkspaceByLocator(pkg);
+    for (const field of cachedFields)
+      data.manifest[field] = effectiveManifest[field] as any;
+
+    for (const scriptName of data.manifest.scripts.keys())
+      if (!cachedScripts.has(scriptName))
+        cachedScripts.delete(scriptName);
+
+    return data;
+  }
+
+  private async ensurePackageDataRecord(locator: Locator, fetchResult: FetchResult) {
+    this.extraneousPackageRecords.delete(locator.locatorHash);
+
+    const record = this.customData.store.get(locator.locatorHash);
+    if (typeof record !== `undefined`)
+      return record;
+
+    const newRecord = await this.fetchPackageDataRecord(fetchResult);
+    this.customData.store.set(locator.locatorHash, newRecord);
+    return newRecord;
+  }
+
+  protected getPackageDataStore() {
+    return this.customData.store;
+  }
+
+  protected getPackageDataRecord(locator: Locator) {
+    const record = this.customData.store.get(locator.locatorHash);
+    if (typeof record === `undefined`)
+      throw new Error(`Assertion failed: Expected locator to have been registered (${structUtils.prettyLocator(this.opts.project.configuration, locator)})`);
+
+    return record;
+  }
+
+  protected extractSuggestedBuildScripts(pkg: Package, pkgDataRecord: PackageDataRecord) {
+    const buildScripts: Array<BuildDirective> = [];
+
+    for (const scriptName of [`preinstall`, `install`, `postinstall`])
+      if (pkgDataRecord.manifest.scripts.has(scriptName))
+        buildScripts.push([BuildType.SCRIPT, scriptName]);
+
+    // Detect cases where a package has a binding.gyp but no install script
+    if (!pkgDataRecord.manifest.scripts.has(`install`) && pkgDataRecord.hasBindingGyp)
+      buildScripts.push([BuildType.SHELLCODE, `node-gyp rebuild`]);
 
     const dependencyMeta = this.opts.project.getDependencyMeta(pkg, pkg.version);
-    const buildScripts = [...packageMeta.buildScripts];
 
     if (buildScripts.length > 0 && !this.opts.project.configuration.get(`enableScripts`) && !dependencyMeta.built) {
       this.opts.report.reportWarningOnce(MessageName.DISABLED_BUILD_SCRIPTS, `${structUtils.prettyLocator(this.opts.project.configuration, pkg)} lists build scripts, but all build scripts have been disabled.`);
@@ -86,8 +190,47 @@ export abstract class AbstractPnpInstaller implements Installer {
       buildScripts.length = 0;
     }
 
+    return buildScripts;
+  }
+
+  async installPackage(pkg: Package, fetchResult: FetchResult) {
+    const pkgDataRecord = await this.ensurePackageDataRecord(pkg, fetchResult);
+
+    const key1 = structUtils.requirableIdent(pkg);
+    const key2 = pkg.reference;
+
+    const hasVirtualInstances =
+      // Only packages with peer dependencies have virtual instances
+      pkg.peerDependencies.size > 0 &&
+      // Virtualized instances have no further virtual instances
+      !structUtils.isVirtualLocator(pkg);
+
+    const shouldRunBuildScripts =
+      // Virtual instance templates don't need to be built, since they don't truly exist
+      !hasVirtualInstances &&
+      // Workspaces aren't built by the linkers; they are managed by the core itself
+      !this.opts.project.tryWorkspaceByLocator(pkg) &&
+      // Only build the packages if the final installer tells us to
+      this.getChildClassSettings().installPackageBuilds;
+
+    const buildScripts = shouldRunBuildScripts
+      ? this.extractSuggestedBuildScripts(pkg, pkgDataRecord)
+      : [];
+
+    const dependencyMeta = this.opts.project.getDependencyMeta(pkg, pkg.version);
+
+    // If the package is hardlinked (ie if Yarn owns its folder), then we let
+    // the concrete installer "transform" the package before we reference it
+    // into the PnP map. We skip this in two cases:
+    //
+    // - If the package is soft-linked then it means the user explicitly
+    //   requested that we use its sources, so we can't tramsform them
+    //
+    // - If the package has virtual instances then it's just a template and
+    //   there's no point transforming it, since it won't be used directly.
+    //
     const packageFs = !hasVirtualInstances && pkg.linkType !== LinkType.SOFT
-      ? await this.transformPackage(pkg, packageMeta, fetchResult, dependencyMeta, {hasBuildScripts: buildScripts.length > 0})
+      ? await this.transformPackage(pkg, pkgDataRecord, fetchResult, dependencyMeta)
       : fetchResult.packageFs;
 
     if (ppath.isAbsolute(fetchResult.prefixPath))
@@ -121,9 +264,14 @@ export abstract class AbstractPnpInstaller implements Installer {
     if (hasVirtualInstances)
       this.blacklistedPaths.add(packageLocation);
 
+    // Ignore the build scripts if the package isn't compatible with the current system
+    const effectiveBuildDirectives = buildScripts.length > 0 && this.checkAndReportManifestCompatibility(pkg, pkgDataRecord.manifest)
+      ? buildScripts
+      : null;
+
     return {
       packageLocation: packageRawLocation,
-      buildDirective: buildScripts.length > 0 && packageMeta.isManifestCompatible ? buildScripts as Array<BuildDirective> : null,
+      buildDirective: effectiveBuildDirectives,
     };
   }
 
@@ -170,7 +318,7 @@ export abstract class AbstractPnpInstaller implements Installer {
         if (this.opts.project.tryWorkspaceByLocator(pkg))
           fallbackExclusionList.push({name: structUtils.requirableIdent(pkg), reference: pkg.reference});
 
-    return await this.finalizeInstallWithPnp({
+    const result = await this.finalizeInstallWithPnp({
       blacklistedLocations,
       dependencyTreeRoots,
       enableTopLevelFallback,
@@ -179,7 +327,17 @@ export abstract class AbstractPnpInstaller implements Installer {
       ignorePattern,
       packageRegistry,
       shebang,
-    }, this.packageMetas);
+    });
+
+    const finalResult: FinalizeInstallData = typeof result !== `undefined`
+      ? result
+      : {};
+
+    if (typeof finalResult.customData === `undefined`)
+      finalResult.customData = {};
+
+    finalResult.customData.AbstractInstallerCustomData = this.customData;
+    return finalResult;
   }
 
   private getPackageInformation(locator: Locator) {

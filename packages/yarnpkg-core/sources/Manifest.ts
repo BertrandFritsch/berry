@@ -115,6 +115,10 @@ export class Manifest {
     return manifest;
   }
 
+  static isManifestFieldCompatible(expected: Array<string> | null, actual: string) {
+    return expected === null || isManifestFieldCompatible(expected, actual);
+  }
+
   static fromText(text: string) {
     const manifest = new Manifest();
     manifest.loadFromText(text);
@@ -546,14 +550,6 @@ export class Manifest {
       return true;
 
     return false;
-  }
-
-  isCompatibleWithOS(os: string): boolean {
-    return this.os === null || isManifestFieldCompatible(this.os, os);
-  }
-
-  isCompatibleWithCPU(cpu: string): boolean {
-    return this.cpu === null || isManifestFieldCompatible(this.cpu, cpu);
   }
 
   ensureDependencyMeta(descriptor: Descriptor) {

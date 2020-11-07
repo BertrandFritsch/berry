@@ -1,13 +1,13 @@
-import {Linker, LinkOptions, MinimalLinkOptions, Manifest, MessageName, DependencyMeta, PackageMeta} from '@yarnpkg/core';
-import {FetchResult, Ident, Locator, Package, BuildDirective, BuildType}                             from '@yarnpkg/core';
-import {miscUtils, structUtils, formatUtils}                                                         from '@yarnpkg/core';
-import {CwdFS, FakeFS, PortablePath, npath, ppath, xfs, Filename}                                    from '@yarnpkg/fslib';
-import {generateInlinedScript, generateSplitScript, PnpSettings}                                     from '@yarnpkg/pnp';
-import {UsageError}                                                                                  from 'clipanion';
+import {Linker, LinkOptions, MinimalLinkOptions, MessageName, DependencyMeta} from '@yarnpkg/core';
+import {FetchResult, Locator, Package}                                        from '@yarnpkg/core';
+import {miscUtils, structUtils, formatUtils}                                  from '@yarnpkg/core';
+import {CwdFS, FakeFS, PortablePath, npath, ppath, xfs, Filename}             from '@yarnpkg/fslib';
+import {generateInlinedScript, generateSplitScript, PnpSettings}              from '@yarnpkg/pnp';
+import {UsageError}                                                           from 'clipanion';
 
-import {AbstractPnpInstaller}                                                                        from './AbstractPnpInstaller';
-import {getPnpPath}                                                                                  from './index';
-import * as pnpUtils                                                                                 from './pnpUtils';
+import {AbstractPnpInstaller, PackageDataRecord}                              from './AbstractPnpInstaller';
+import {getPnpPath}                                                           from './index';
+import * as pnpUtils                                                          from './pnpUtils';
 
 const FORCED_UNPLUG_PACKAGES = new Set([
   // Some packages do weird stuff and MUST be unplugged. I don't like them.
@@ -17,17 +17,6 @@ const FORCED_UNPLUG_PACKAGES = new Set([
   structUtils.makeIdent(null, `node-addon-api`).identHash,
   // Those ones contain native builds (*.node), and Node loads them through dlopen
   structUtils.makeIdent(null, `fsevents`).identHash,
-]);
-
-const FORCED_UNPLUG_FILETYPES = new Set([
-  // Windows can't execute exe files inside zip archives
-  `.exe`,
-  // The c/c++ compiler can't read files from zip archives
-  `.h`, `.hh`, `.hpp`, `.c`, `.cc`, `.cpp`,
-  // The java runtime can't read files from zip archives
-  `.java`, `.jar`,
-  // Node opens these through dlopen
-  `.node`,
 ]);
 
 export class PnpLinker implements Linker {
@@ -85,54 +74,15 @@ export class PnpInstaller extends AbstractPnpInstaller {
 
   private readonly unpluggedPaths: Set<string> = new Set();
 
-  getPackageMetaKey(pkg: Package): string {
-    return `pnp1${pkg.locatorHash}`;
-  }
-
-  async fetchPackageMeta(pkg: Package, fetchResult: FetchResult): Promise<PackageMeta> {
-    const hasVirtualInstances =
-      pkg.peerDependencies.size > 0 &&
-      !structUtils.isVirtualLocator(pkg) &&
-      !this.opts.project.tryWorkspaceByLocator(pkg);
-
-    const manifest = !hasVirtualInstances || this.opts.skipIncompatiblePackageLinking
-      ? await Manifest.tryFind(fetchResult.prefixPath, {baseFs: fetchResult.packageFs})
-      : null;
-    const isManifestCompatible = this.checkAndReportManifestIncompatibility(manifest, pkg);
-
-    const buildScripts = !hasVirtualInstances
-      ? await this.getBuildScripts(pkg, manifest, fetchResult)
-      : [];
-
+  getChildClassSettings() {
     return {
-      isManifestCompatible,
-      buildScripts,
-      preferUnplugged: !manifest ? null : manifest.preferUnplugged,
-      extractHint: fetchResult.packageFs.getExtractHint({relevantExtensions:FORCED_UNPLUG_FILETYPES}),
+      installPackageBuilds: true,
     };
   }
 
-  async getBuildScripts(locator: Locator, manifest: Manifest | null, fetchResult: FetchResult): Promise<Array<BuildDirective>> {
-    if (manifest === null)
-      return [];
-
-    const buildScripts: Array<BuildDirective> = [];
-
-    for (const scriptName of [`preinstall`, `install`, `postinstall`])
-      if (manifest.scripts.has(scriptName))
-        buildScripts.push([BuildType.SCRIPT, scriptName]);
-
-    // Detect cases where a package has a binding.gyp but no install script
-    const bindingFilePath = ppath.join(fetchResult.prefixPath, `binding.gyp` as Filename);
-    if (!manifest.scripts.has(`install`) && fetchResult.packageFs.existsSync(bindingFilePath))
-      buildScripts.push([BuildType.SHELLCODE, `node-gyp rebuild`]);
-
-    return buildScripts;
-  }
-
-  async transformPackage(locator: Locator, packageMeta: PackageMeta, fetchResult: FetchResult, dependencyMeta: DependencyMeta, {hasBuildScripts}: {hasBuildScripts: boolean}) {
-    if (this.isUnplugged(locator, packageMeta, dependencyMeta, {hasBuildScripts})) {
-      return this.unplugPackage(locator, fetchResult.packageFs);
+  async transformPackage(pkg: Package, pkgDataRecord: PackageDataRecord, fetchResult: FetchResult, dependencyMeta: DependencyMeta) {
+    if (this.isUnplugged(pkg, pkgDataRecord, dependencyMeta)) {
+      return this.unplugPackage(pkg, fetchResult.packageFs);
     } else {
       return fetchResult.packageFs;
     }
@@ -232,17 +182,17 @@ export class PnpInstaller extends AbstractPnpInstaller {
     return new CwdFS(unplugPath);
   }
 
-  private isUnplugged(ident: Ident, packageMeta: PackageMeta, dependencyMeta: DependencyMeta, {hasBuildScripts}: {hasBuildScripts: boolean}) {
+  private isUnplugged(pkg: Package, pkgDataRecord: PackageDataRecord, dependencyMeta: DependencyMeta) {
     if (typeof dependencyMeta.unplugged !== `undefined`)
       return dependencyMeta.unplugged;
 
-    if (FORCED_UNPLUG_PACKAGES.has(ident.identHash))
+    if (FORCED_UNPLUG_PACKAGES.has(pkg.identHash))
       return true;
 
-    if (packageMeta.preferUnplugged !== null)
-      return packageMeta.preferUnplugged;
+    if (pkgDataRecord.manifest.preferUnplugged !== null)
+      return pkgDataRecord.manifest.preferUnplugged;
 
-    if (hasBuildScripts || packageMeta.extractHint)
+    if (this.extractSuggestedBuildScripts(pkg, pkgDataRecord).length > 0 || pkgDataRecord.extractHint)
       return true;
 
     return false;

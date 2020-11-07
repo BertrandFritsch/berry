@@ -263,6 +263,12 @@ export default class YarnCommand extends BaseCommand {
     if (!workspace)
       throw new WorkspaceRequiredError(project.cwd, this.context.cwd);
 
+    // We only need the install state to restore the installers' custom data,
+    // so we can disable the light resolution.
+    await project.restoreInstallState({
+      lightResolutionFallback: false,
+    });
+
     // Important: Because other commands also need to run installs, if you
     // get in a situation where you need to change this file in order to
     // customize the install it's very likely you're doing something wrong.

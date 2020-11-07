@@ -91,12 +91,11 @@ export class Project {
   public storedPackages: Map<LocatorHash, Package> = new Map();
   public storedChecksums: Map<LocatorHash, string> = new Map();
 
-  private storedPackageMetas: Map<string, Record<string, any>> = new Map();
-  private packageMetaKeysAccessed: Set<string> = new Set();
-
   public accessibleLocators: Set<LocatorHash> = new Set();
   public originalPackages: Map<LocatorHash, Package> = new Map();
   public optionalBuilds: Set<LocatorHash> = new Set();
+
+  public installerCustomData: Map<string, any> = new Map();
 
   public lockFileChecksum: string | null = null;
 
@@ -1077,11 +1076,7 @@ export class Project {
 
         try {
           for (const installer of installers.values()) {
-            // Retrieve and pass packageMeta, but do not store it into the cache for workspace packages
-            let packageMeta;
-            if (installer.fetchPackageMeta)
-              packageMeta = await installer.fetchPackageMeta(pkg, fetchResult);
-            await installer.installPackage(pkg, fetchResult, packageMeta);
+            await installer.installPackage(pkg, fetchResult);
           }
         } finally {
           if (fetchResult.releaseFs) {
@@ -1109,18 +1104,7 @@ export class Project {
 
         let installStatus;
         try {
-          let packageMeta;
-          let metaKey;
-          if (installer.getPackageMetaKey) {
-            metaKey = installer.getPackageMetaKey(pkg);
-            packageMeta = this.storedPackageMetas.get(metaKey);
-            this.packageMetaKeysAccessed.add(metaKey);
-          }
-          if (!packageMeta && metaKey && installer.fetchPackageMeta) {
-            packageMeta = await installer.fetchPackageMeta(pkg, fetchResult);
-            this.storedPackageMetas.set(metaKey, packageMeta);
-          }
-          installStatus = await installer.installPackage(pkg, fetchResult, packageMeta);
+          installStatus = await installer.installPackage(pkg, fetchResult);
         } finally {
           if (fetchResult.releaseFs) {
             fetchResult.releaseFs();
@@ -1225,23 +1209,22 @@ export class Project {
 
     // Step 3: Inform our linkers that they should have all the info needed
 
+    const newCustomData = new Map<string, any>();
+
     for (const installer of installers.values()) {
-      const installStatuses = await installer.finalizeInstall();
-      if (installStatuses) {
-        for (const installStatus of installStatuses) {
-          if (installStatus.buildDirective) {
-            packageBuildDirectives.set(installStatus.locatorHash!, {
-              directives: installStatus.buildDirective,
-              buildLocations: installStatus.buildLocations,
-            });
-          }
+      const installData = await installer.finalizeInstall();
+
+      if (typeof installData?.customData !== `undefined`)
+        newCustomData.set(installer.getCustomDataKey(), installData.customData);
+
+      for (const installStatus of installData?.records ?? []) {
+        if (installStatus.buildDirective) {
+          packageBuildDirectives.set(installStatus.locatorHash!, {
+            directives: installStatus.buildDirective,
+            buildLocations: installStatus.buildLocations,
+          });
         }
       }
-    }
-
-    if (typeof persistProject === `undefined` || persistProject) {
-      this.cleanupPackageMetas();
-      await this.persist();
     }
 
     // Step 4: Build the packages in multiple steps
@@ -1479,8 +1462,6 @@ export class Project {
     const nodeLinker = this.configuration.get(`nodeLinker`);
     Configuration.telemetry?.reportInstall(nodeLinker);
 
-    await this.restoreStateForInstall();
-
     const validationWarnings: Array<{name: MessageName, text: string}> = [];
     const validationErrors: Array<{name: MessageName, text: string}> = [];
 
@@ -1701,17 +1682,9 @@ export class Project {
     });
   }
 
-  private cleanupPackageMetas() {
-    for (const key of this.storedPackageMetas.keys()) {
-      if (!this.packageMetaKeysAccessed.has(key)) {
-        this.storedPackageMetas.delete(key);
-      }
-    }
-  }
-
   async persistInstallStateFile() {
-    const {accessibleLocators, optionalBuilds, storedDescriptors, storedResolutions, storedPackages, storedPackageMetas, lockFileChecksum} = this;
-    const installState = {accessibleLocators, optionalBuilds, storedDescriptors, storedResolutions, storedPackages, storedPackageMetas, lockFileChecksum};
+    const {accessibleLocators, optionalBuilds, storedDescriptors, storedResolutions, storedPackages, installerCustomData, lockFileChecksum} = this;
+    const installState = {accessibleLocators, optionalBuilds, storedDescriptors, storedResolutions, storedPackages, installerCustomData, lockFileChecksum};
     const serializedState = await gzip(v8.serialize(installState));
 
     const installStatePath = this.configuration.get(`installStatePath`);
@@ -1720,22 +1693,22 @@ export class Project {
     await xfs.writeFilePromise(installStatePath, serializedState as Buffer);
   }
 
-  async restoreStateForInstall() {
-    const installStatePath = this.configuration.get(`installStatePath`);
-    if (!xfs.existsSync(installStatePath))
-      return;
-
-    const serializedState = await xfs.readFilePromise(installStatePath);
-    const installState = v8.deserialize(await gunzip(serializedState) as Buffer);
-    if (installState.storedPackageMetas) {
-      Object.assign(this, {storedPackageMetas: installState.storedPackageMetas});
-    }
-  }
-
-  async restoreInstallState() {
+  /**
+   * Retrieve the install state from the local cache. Calling this function
+   * is mandatory if you wish to use the storedDescriptors, storedResolutions,
+   * or storedPackages fields without having to run a full-blown install.
+   *
+   * If there is no install state to restore, this function will perform a
+   * light resolution pass (exclusively based on the lockfile) in order to
+   * hydrate the most basic information about the dependency tree. This can
+   * be disabled by setting the `lightResolutionFallback` option to `false`.
+   */
+  async restoreInstallState({lightResolutionFallback = true}: {lightResolutionFallback?: boolean} = {}) {
     const installStatePath = this.configuration.get(`installStatePath`);
     if (!xfs.existsSync(installStatePath)) {
-      await this.applyLightResolution();
+      if (lightResolutionFallback)
+        await this.applyLightResolution();
+
       return;
     }
 
@@ -1743,7 +1716,9 @@ export class Project {
     const installState = v8.deserialize(await gunzip(serializedState) as Buffer);
 
     if (installState.lockFileChecksum !== this.lockFileChecksum) {
-      await this.applyLightResolution();
+      if (lightResolutionFallback)
+        await this.applyLightResolution();
+
       return;
     }
 

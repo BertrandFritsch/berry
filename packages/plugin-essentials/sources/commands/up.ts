@@ -71,6 +71,12 @@ export default class UpCommand extends BaseCommand {
     if (!workspace)
       throw new WorkspaceRequiredError(project.cwd, this.context.cwd);
 
+    // We only need the install state to restore the installers' custom data,
+    // so we can disable the light resolution.
+    await project.restoreInstallState({
+      lightResolutionFallback: false,
+    });
+
     const interactive = this.interactive ?? configuration.get(`preferInteractive`);
 
     const modifier = suggestUtils.getModifier(this, project);
